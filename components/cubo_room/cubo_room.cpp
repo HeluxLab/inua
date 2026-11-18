@@ -439,11 +439,15 @@ void CuboRoom::dump_config() {
     ESP_LOGCONFIG(TAG, "  Descubrimiento: encendido (lista los aparatos BLE cercanos cada 10 s)");
 }
 
-bool CuboRoom::parse_devices(const esp32_ble::BLEScanResult *scan_results, size_t count) {
-  for (size_t n = 0; n < count; n++) {
-    const esp32_ble::BLEScanResult &r = scan_results[n];
+bool CuboRoom::parse_device(const esp32_ble_tracker::ESPBTDevice &device) {
+  this->handle_scan_result_(device.get_scan_result());
+  return false;  // no "reclama" el aparato: los demás oyentes lo siguen viendo
+}
+
+void CuboRoom::handle_scan_result_(const esp32_ble::BLEScanResult &r) {
+  {
     if (r.rssi >= 20)
-      continue;  // 127 = el controlador no pudo medir
+      return;  // 127 = el controlador no pudo medir
     uint64_t address = 0;
     for (int i = 0; i < 6; i++)
       address = (address << 8) | r.bda[i];
@@ -472,7 +476,6 @@ bool CuboRoom::parse_devices(const esp32_ble::BLEScanResult *scan_results, size_
     if (!known && this->discovery_ && r.rssi >= DISCOVERY_MIN_RSSI)
       this->note_stranger_(address, r.rssi, ib, r.ble_adv, len);
   }
-  return false;
 }
 
 void CuboRoom::loop() {

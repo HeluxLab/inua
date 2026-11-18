@@ -3,8 +3,9 @@
 Cada habitación tiene una o más balizas fijas: una tecla HELUX que emite iBeacon, una etiqueta
 iBeacon cualquiera o cualquier aparato BLE con dirección fija (un termómetro, por ejemplo).
 El cubo escanea mientras está despierto, se queda con la más fuerte y publica la habitación.
-Componente externo de ESPHome; se cuelga de `esp32_ble_tracker` como oyente de anuncios crudos,
-así no arrastra el analizador completo de dispositivos BLE."""
+Componente externo de ESPHome; se cuelga de `esp32_ble_tracker` como oyente normal y analiza el
+anuncio crudo que viene adentro de cada dispositivo. No usa el canal de anuncios crudos: desde
+ESPHome 2026.10 admite un solo oyente y lo toma el proxy Bluetooth si el usuario lo agrega."""
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -122,7 +123,8 @@ CONFIG_SCHEMA = (
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
-    await esp32_ble_tracker.register_raw_ble_device(var, config)
+    # Oyente normal (no el canal de anuncios crudos, que en ESPHome 2026.10 es de un solo oyente).
+    await esp32_ble_tracker.register_ble_device(var, config)
 
     cg.add(var.set_hysteresis(config[CONF_HYSTERESIS]))
     cg.add(var.set_min_rssi(config[CONF_MIN_RSSI]))

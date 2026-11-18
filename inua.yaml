@@ -69,6 +69,8 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  # Probado con 2026.10.2. Con una versión anterior avisa en vez de fallar con un error raro.
+  min_version: 2026.10.0
   on_boot:
     - priority: 599          # sensores ya leídos, Wi-Fi todavía no: batería baja -> ship mode
       then:

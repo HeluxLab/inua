@@ -7,8 +7,8 @@ feel a haptic click for every step. On its charging dock it also works as a voic
 The firmware is [ESPHome](https://esphome.io) on ESP-IDF and talks to Home Assistant over the
 native API, on your local network. No cloud and no account.
 
-> **Status: prototype.** The firmware compiles with ESPHome 2026.6.5. It has **not been tested on
-> the hardware yet**: the first boards are being made. Expect changes.
+> **Status: prototype.** The firmware compiles with ESPHome 2026.10.2 and needs 2026.10.0 or newer.
+> It has **not been tested on the hardware yet**: the first boards are being made. Expect changes.
 
 ## Hardware
 

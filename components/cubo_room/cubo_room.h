@@ -150,14 +150,10 @@ class CuboRoom : public Component, public esp32_ble_tracker::ESPBTDeviceListener
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
-  bool parse_devices(const esp32_ble::BLEScanResult *scan_results, size_t count) override;
-#ifdef USE_ESP32_BLE_DEVICE
-  // Solo existe si otro componente pide el analizador completo; acá alcanza con el anuncio crudo.
-  bool parse_device(const esp32_ble_tracker::ESPBTDevice &device) override { return false; }
-#endif
-  esp32_ble_tracker::AdvertisementParserType get_advertisement_parser_type() override {
-    return esp32_ble_tracker::AdvertisementParserType::RAW_ADVERTISEMENTS;
-  }
+  // Cada anuncio llega como dispositivo y trae adentro el anuncio crudo, que es lo que se analiza.
+  // No se usa el canal de anuncios crudos: desde ESPHome 2026.10 admite un solo oyente y lo toma
+  // el proxy Bluetooth si el usuario lo agrega.
+  bool parse_device(const esp32_ble_tracker::ESPBTDevice &device) override;
 
   void set_hysteresis(float db) { this->logic_.hysteresis = db; }
   void set_min_rssi(int dbm) { this->logic_.min_rssi = (float) dbm; }
@@ -230,6 +226,7 @@ class CuboRoom : public Component, public esp32_ble_tracker::ESPBTDeviceListener
     uint16_t count{0};
   };
 
+  void handle_scan_result_(const esp32_ble::BLEScanResult &r);
   void load_learned_();
   void save_learned_();
   void publish_beacons_(const std::string &prefix = "");

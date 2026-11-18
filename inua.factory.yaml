@@ -1,10 +1,11 @@
 # =============================================================================
 #  INUA de fábrica: lo que lleva grabado la unidad que se vende.
 #  Es inua.yaml más lo que pide el programa Made for ESPHome:
-#    - carga de Wi-Fi por Bluetooth (Improv), además de la de USB y el punto de acceso
+#    - carga de Wi-Fi por Bluetooth (Improv), además del punto de acceso propio
 #    - datos del proyecto y adopción desde ESPHome Device Builder
-#    - actualizaciones publicadas por el fabricante
-#  PENDIENTE antes de pedir el sello: manifiesto de actualizaciones real (marcado abajo).
+#    - actualizaciones publicadas por el fabricante (GitHub Pages del repositorio)
+#  Las versiones las arma GitHub Actions (.github/workflows en el repositorio): cada push a main
+#  deja un borrador de versión, y el flujo "Release" lo publica a mano.
 # =============================================================================
 
 substitutions:
@@ -18,14 +19,15 @@ esphome:
   name_add_mac_suffix: true          # un mismo binario sirve para todas las unidades
   project:
     name: heluxlabs.inua
-    version: "0.1.0"
+    version: dev                     # GitHub Actions lo reemplaza por la versión de cada release
 
 # El usuario adopta el cubo y pasa a compilar esta configuración pública por su cuenta.
 dashboard_import:
   package_import_url: github://HeluxLab/inua/inua.yaml@main
 
-esp32_improv:
-  id: improv_ble
+# Carga de Wi-Fi por Bluetooth (Improv). Hasta ESPHome 2026.9 se llamaba esp32_improv.
+improv_ble:
+  id: wifi_improv
   authorizer: none
 
 http_request:
@@ -39,4 +41,6 @@ update:
   - platform: http_request
     id: firmware_update
     name: "Firmware"
-    source: https://heluxlabs.ar/firmware/inua/manifest.json   # PENDIENTE: publicar el manifiesto
+    # Lo publica el flujo "Publish Pages" del repositorio. Si se renombra la organización de GitHub,
+    # esta dirección cambia: actualizarla antes de que salga cualquier cubo.
+    source: https://heluxlab.github.io/inua/firmware/inua.manifest.json

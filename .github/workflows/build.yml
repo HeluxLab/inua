@@ -1,0 +1,33 @@
+name: Build
+
+# Taken from esphome/esphome-project-template (workflows ref 2026.9.0).
+# Builds inua.factory.yaml on every push to main (after Release Drafter) and attaches the
+# firmware to the draft release. Nothing is published until the Release workflow is run by hand.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Release Drafter"]
+    types: [completed]
+
+# The called workflow's draft-release jobs (read draft info, upload assets,
+# strip the pending warning) need contents: write; they only run on
+# workflow_run events. Fork pull requests still get a read-only token.
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_run' && 'release-drafter' || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build to Draft Release
+    uses: esphome/workflows/.github/workflows/build-to-draft-release.yml@cc3e76de337dc59bc1cba8da58d963cd23b873f1  # 2026.9.0
+    with:
+      # Every *.factory.yaml in the repo is discovered automatically; the builds are combined
+      # into a single manifest published as firmware/inua.manifest.json.
+      combined-name: inua
+      # The version the firmware has been tested with.
+      esphome-version: 2026.10.2
