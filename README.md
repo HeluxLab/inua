@@ -51,7 +51,6 @@ and sleep handling.
 |---|---|
 | `inua.yaml` | The device configuration. No credentials. This is what you adopt or include. |
 | `inua.factory.yaml` | What the units ship with: `inua.yaml` plus Wi-Fi setup over Bluetooth (Improv), project info, adoption from the ESPHome dashboard and firmware updates. |
-| `autoprueba.yaml` | Self-test firmware for the first power-up of a board and for production. Needs no Wi-Fi or Home Assistant. Its texts are in Spanish. |
 | `components/` | The six custom ESPHome components. |
 | `tools/sim_room.py` | Python copy of the room decision rule, to test it with synthetic signals. |
 
