@@ -1,0 +1,42 @@
+# =============================================================================
+#  INUA de fábrica: lo que lleva grabado la unidad que se vende.
+#  Es inua.yaml más lo que pide el programa Made for ESPHome:
+#    - carga de Wi-Fi por Bluetooth (Improv), además de la de USB y el punto de acceso
+#    - datos del proyecto y adopción desde ESPHome Device Builder
+#    - actualizaciones publicadas por el fabricante
+#  PENDIENTE antes de pedir el sello: manifiesto de actualizaciones real (marcado abajo).
+# =============================================================================
+
+substitutions:
+  name: inua
+  friendly_name: Inua
+
+packages:
+  inua: !include inua.yaml
+
+esphome:
+  name_add_mac_suffix: true          # un mismo binario sirve para todas las unidades
+  project:
+    name: heluxlabs.inua
+    version: "0.1.0"
+
+# El usuario adopta el cubo y pasa a compilar esta configuración pública por su cuenta.
+dashboard_import:
+  package_import_url: github://HeluxLab/inua/inua.yaml@main
+
+esp32_improv:
+  id: improv_ble
+  authorizer: none
+
+http_request:
+  id: http_client
+
+ota:
+  - platform: http_request
+    id: ota_http
+
+update:
+  - platform: http_request
+    id: firmware_update
+    name: "Firmware"
+    source: https://heluxlabs.ar/firmware/inua/manifest.json   # PENDIENTE: publicar el manifiesto

@@ -1,0 +1,567 @@
+# =============================================================================
+#  INUA — firmware de autoprueba (primer encendido de una placa y prueba de fábrica)
+#
+#  No necesita Wi-Fi ni Home Assistant. Al arrancar prueba cada parte de la placa, escribe el
+#  resultado en el registro (USB) y lo avisa con sonido y vibración:
+#      todo bien   -> cuatro notas que suben y un clic
+#      algo falla  -> dos notas graves y tres clics
+#  Si no se oye nada ni vibra, el parlante y el motor están entre las fallas: mirar el registro.
+#
+#  También levanta la red Wi-Fi "Inua-prueba" (sin clave). Conectando un teléfono y abriendo
+#  http://192.168.4.1 se ve el resultado, los valores medidos y los botones para repetir la
+#  prueba, probar el motor y el parlante, dormir 30 s (para medir el consumo) y pasar a ship mode.
+#  Desde esa misma página se puede cargar después el firmware del producto.
+#
+#  Qué prueba solo:
+#    - que respondan los cuatro chips del bus I2C (cargador, medidor, háptico, sensor de movimiento)
+#    - memoria PSRAM
+#    - estado y fallas del cargador, tensión de la batería
+#    - sensor de movimiento andando y con una cara arriba
+#    - motor háptico: da un clic y mira si el acelerómetro lo sintió
+#    - parlante y micrófono juntos: emite un tono y mide si el micrófono lo escucha
+#    - Bluetooth y antena: cuenta los aparatos que se oyen cerca
+#  Qué queda para probar a mano (cada gesto sale en el registro y da su clic):
+#    - girar, deslizar, tocar y cambiar de cara
+#    - apoyar en la base: "En el dock" pasa a encendido
+#    - dormir 30 s: el cubo despierta solo, o antes si se lo mueve
+#
+#  Uso:   esphome run autoprueba.yaml
+# =============================================================================
+
+substitutions:
+  haptic_motor: reactor
+  haptic_frequency: 160Hz
+
+esphome:
+  name: inua-prueba
+  friendly_name: Inua prueba
+  includes:
+    - autoprueba.h
+  on_boot:
+    - priority: -100         # con todo ya inicializado
+      then:
+        - delay: 4s          # el sensor de movimiento tarda en asentarse y el Bluetooth junta anuncios
+        - script.execute: autoprueba
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 4MB
+  # La tabla de particiones del producto la pone cubo_system: después se carga el producto por red.
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+psram:
+  id: psram_cfg
+  mode: quad
+  speed: 80MHz
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+logger:
+  id: cube_logger
+  level: DEBUG               # con la placa nueva conviene ver todo
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  id: wifi_net
+  ap:
+    ssid: "Inua-prueba"
+  reboot_timeout: 0s         # no hay red a la que conectarse: no reiniciar por eso
+
+captive_portal:
+  id: portal
+
+web_server:
+  id: web
+  port: 80
+  version: 3
+  local: true                # el teléfono conectado al cubo no tiene internet: la página va adentro
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+  - platform: web_server
+    id: ota_web
+
+i2c:
+  id: bus_i2c
+  sda: GPIO8
+  scl: GPIO9
+  frequency: 100kHz
+  scan: true
+
+globals:
+  - id: ble_n
+    type: int
+    initial_value: '0'
+  - id: ble_best
+    type: int
+    initial_value: '-127'
+  - id: ruido
+    type: float
+    initial_value: 'NAN'
+  - id: quieto
+    type: bool
+    initial_value: 'false'
+
+# ----------------------------------------------------------------------------
+#  Los mismos periféricos que el producto, con la misma configuración
+# ----------------------------------------------------------------------------
+cubo_system:
+  id: sys
+  hold_low_pins: [13, 14, 4]
+  low_battery_pin: 17
+
+lsm6dsv_cubo:
+  id: imu
+  address: 0x6A
+  update_interval: 20ms
+  step_degrees: 15
+  rotation_deadband: 6
+  slide_threshold: 3.0
+  wake_threshold: 80
+  wake_duration: 2
+  tap_threshold: 500
+  face_names: ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]
+  on_rotate:
+    - drv2605.pulse: 1
+    - logger.log:
+        tag: prueba
+        level: INFO
+        format: "GESTO: perilla, %d paso"
+        args: ['steps']
+  on_slide:
+    - drv2605.pulse: 2
+    - logger.log:
+        tag: prueba
+        level: INFO
+        format: "GESTO: deslizamiento %s"
+        args: ['direction.c_str()']
+  on_tap:
+    - drv2605.pulse: 1
+    - logger.log:
+        tag: prueba
+        level: INFO
+        format: "GESTO: toque"
+  on_face:
+    - drv2605.pulse: 3
+    - logger.log:
+        tag: prueba
+        level: INFO
+        format: "GESTO: cara arriba %d (eje %s)"
+        args: ['face + 1', 'name.c_str()']
+
+bq25896:
+  id: charger
+  address: 0x6B
+  update_interval: 5s
+  charge_current: 1024
+  charge_voltage: 4208
+  input_current_limit: 3250
+  battery_empty_voltage: 3300
+  battery_full_voltage: 4150
+
+drv2605:
+  id: haptic
+  address: 0x5A
+  motor_type: ${haptic_motor}
+  lra_frequency: ${haptic_frequency}
+  rated_voltage: 3.0V
+  max_voltage: 3.0V
+  on_drive:
+    - lsm6dsv_cubo.inhibit_tap: 150ms
+
+esp32_ble:
+  id: ble
+  use_psram: true
+
+esp32_ble_tracker:
+  id: ble_tracker
+  scan_parameters:
+    interval: 160ms
+    window: 40ms
+    active: false
+    continuous: true
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            id(ble_n)++;
+            if (x.get_rssi() > id(ble_best) && x.get_rssi() < 20)
+              id(ble_best) = x.get_rssi();
+
+i2s_audio:
+  - id: i2s_mic              # primero: I2S0, el único puerto del S3 que recibe PDM
+    i2s_lrclk_pin: GPIO14
+  - id: i2s_amp
+    i2s_lrclk_pin: GPIO11
+    i2s_bclk_pin: GPIO10
+
+microphone:
+  - platform: i2s_audio
+    id: mic
+    i2s_audio_id: i2s_mic
+    adc_type: external
+    i2s_din_pin: GPIO15
+    pdm: true
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 16bit
+
+speaker:
+  - platform: i2s_audio
+    id: spk
+    i2s_audio_id: i2s_amp
+    dac_type: external
+    i2s_dout_pin: GPIO12
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: mono
+    buffer_duration: 100ms
+
+rtttl:
+  id: tonos
+  speaker: spk
+  gain: 80%
+
+output:
+  - platform: gpio
+    id: amp_enable
+    pin: GPIO13
+
+deep_sleep:
+  id: ds
+  wakeup_pin:
+    number: GPIO5
+  wakeup_pin_mode: IGNORE
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO6
+        allow_other_uses: true
+      - number: GPIO17
+        allow_other_uses: true
+    mode: ANY_LOW
+
+# ----------------------------------------------------------------------------
+#  La prueba
+# ----------------------------------------------------------------------------
+script:
+  - id: autoprueba
+    mode: single
+    then:
+      - lambda: |-
+          prueba::empezar();
+          id(resultado).publish_state("Probando...");
+
+      # --- 1. Los cuatro chips del bus I2C, leídos directo ---
+      - lambda: |-
+          uint8_t v = 0;
+          uint8_t w[2] = {0, 0};
+          bool ok;
+
+          ok = prueba::leer(id(bus_i2c), 0x6B, 0x14, &v);
+          if (ok)
+            prueba::paso("Cargador BQ25896", true, "responde en 0x6B (REG14=0x%02X, modelo %u, revisión %u)", v,
+                         (v >> 3) & 7, v & 3);
+          else
+            prueba::paso("Cargador BQ25896", false, "no responde en 0x6B");
+
+          ok = prueba::leer(id(bus_i2c), 0x36, 0x02, w, 2);
+          if (ok) {
+            const float volts = (float) ((w[0] << 8) | w[1]) * 78.125e-6f;
+            prueba::paso("Medidor MAX17048", volts > 2.5f && volts < 4.5f,
+                         "responde en 0x36, lee %.2f V en la batería (esperado entre 2,5 y 4,5)", volts);
+          } else {
+            prueba::paso("Medidor MAX17048", false, "no responde en 0x36");
+          }
+
+          ok = prueba::leer(id(bus_i2c), 0x5A, 0x00, &v);
+          if (ok)
+            prueba::paso("Háptico DRV2605L", true, "responde en 0x5A (STATUS=0x%02X, identificador %u, esperado 7)", v,
+                         v >> 5);
+          else
+            prueba::paso("Háptico DRV2605L", false, "no responde en 0x5A");
+
+          ok = prueba::leer(id(bus_i2c), 0x6A, 0x0F, &v);
+          if (ok)
+            prueba::paso("Sensor LSM6DSV16X", v == 0x70, "responde en 0x6A (identificador 0x%02X, esperado 0x70)", v);
+          else
+            prueba::paso("Sensor LSM6DSV16X", false, "no responde en 0x6A");
+
+      # --- 2. Memoria PSRAM ---
+      - lambda: |-
+          const size_t psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+          prueba::paso("Memoria PSRAM", psram > 1900000, "%u bytes (esperado cerca de 2.000.000)", (unsigned) psram);
+
+      # --- 3. Cargador: estado y fallas ---
+      - lambda: |-
+          uint8_t st = 0, f1 = 0, f2 = 0;
+          static const char *const CARGA[] = {"sin cargar", "precarga", "carga rápida", "carga completa"};
+          if (prueba::leer(id(bus_i2c), 0x6B, 0x0B, &st)) {
+            prueba::nota("Alimentación", "%s, %s (REG0B=0x%02X)", (st & 0x04) ? "5 V presentes" : "sin 5 V",
+                         CARGA[(st >> 3) & 3], st);
+          }
+          // El registro de fallas guarda la última hasta que se lee: la segunda lectura es la actual.
+          const bool r1 = prueba::leer(id(bus_i2c), 0x6B, 0x0C, &f1);
+          const bool r2 = prueba::leer(id(bus_i2c), 0x6B, 0x0C, &f2);
+          if (r1 && r2)
+            prueba::paso("Cargador sin fallas", f2 == 0,
+                         f2 == 0 ? "ninguna falla activa (anterior 0x%02X)" : "falla activa 0x%02X (bits 0 a 2: sensor de temperatura; 3: batería; 4 y 5: carga)",
+                         f2 == 0 ? f1 : f2);
+          if (!std::isnan(id(battery_level).state))
+            prueba::nota("Batería", "%.0f %%, %.2f V", id(battery_level).state, id(battery_voltage).state);
+          if (!std::isnan(id(vbus_voltage).state))
+            prueba::nota("Entrada", "%.2f V, corriente de carga %.0f mA", id(vbus_voltage).state,
+                         id(charge_current).state);
+
+      # --- 4. Sensor de movimiento andando ---
+      - lambda: |-
+          const bool listo = id(imu).is_ready();
+          const int cara = id(imu).get_face();
+          if (listo && cara < 6)
+            prueba::paso("Sensor andando", true, "cara %d arriba (eje %s)", cara + 1, id(imu).get_face_name().c_str());
+          else if (listo)
+            prueba::paso("Sensor andando", false, "anda, pero no reconoce qué cara está arriba: apoyar el cubo quieto");
+          else
+            prueba::paso("Sensor andando", false, "el sensor no terminó de arrancar");
+          id(quieto) = !id(imu).is_moving();
+
+      # --- 5. Motor háptico: un clic, y el acelerómetro dice si lo sintió ---
+      - drv2605.pulse: 3
+      - delay: 150ms
+      - lambda: |-
+          if (id(haptic).is_failed()) {
+            prueba::paso("Motor háptico", false, "el DRV2605L no arrancó");
+          } else if (id(quieto) && id(imu).is_moving()) {
+            prueba::paso("Motor háptico", true, "clic enviado y el acelerómetro lo sintió");
+          } else if (id(quieto)) {
+            prueba::nota("Motor háptico", "clic enviado; el acelerómetro no lo registró. ¿Se sintió en la mano?");
+          } else {
+            prueba::nota("Motor háptico", "clic enviado; el cubo se estaba moviendo y no se pudo confirmar solo");
+          }
+
+      # --- 6. Parlante y micrófono: un tono de 2 s y el micrófono tiene que escucharlo ---
+      - output.turn_on: amp_enable
+      - delay: 700ms
+      - lambda: 'id(ruido) = id(mic_rms).state;'
+      - rtttl.play: "t:d=1,o=6,b=120:a"
+      - delay: 1000ms
+      - lambda: |-
+          const float tono = id(mic_rms).state;
+          if (std::isnan(tono) || std::isnan(id(ruido))) {
+            prueba::paso("Parlante y micrófono", false, "el micrófono no entregó ninguna medición");
+          } else {
+            const float d = tono - id(ruido);
+            prueba::paso("Parlante y micrófono", d >= 6.0f,
+                         "silencio %.0f dB, con el tono %.0f dB: diferencia %.0f dB (mínimo 6)", id(ruido), tono, d);
+          }
+      - delay: 1300ms
+      - rtttl.stop:
+
+      # --- 7. Bluetooth y antena ---
+      - lambda: |-
+          if (id(ble_n) > 0)
+            prueba::paso("Bluetooth y antena", true, "%d anuncios oídos, el más fuerte a %d dBm", id(ble_n),
+                         id(ble_best));
+          else
+            prueba::paso("Bluetooth y antena", false, "no se oyó ningún aparato en %u s: revisar la antena",
+                         (unsigned) (millis() / 1000));
+          prueba::nota("Wi-Fi", "red \"Inua-prueba\" emitiendo; página en http://192.168.4.1");
+          prueba::nota("Despertó por", "%s", id(sys).wake_cause());
+
+      # --- Resultado ---
+      - lambda: |-
+          if (prueba::fallas().empty()) {
+            ESP_LOGI("prueba", "RESULTADO: TODO BIEN (%d pruebas)", prueba::total());
+            id(resultado).publish_state("OK");
+          } else {
+            ESP_LOGE("prueba", "RESULTADO: FALLA en: %s", prueba::fallas().c_str());
+            id(resultado).publish_state("FALLA: " + prueba::fallas());
+          }
+          ESP_LOGI("prueba", "A mano: girar, deslizar, tocar y dar vuelta el cubo. Cada gesto sale acá abajo.");
+      - if:
+          condition:
+            lambda: 'return prueba::fallas().empty();'
+          then:
+            - rtttl.play: "bien:d=8,o=6,b=200:c,e,g,c7"
+            - delay: 900ms
+            - drv2605.pulse: 3
+          else:
+            - rtttl.play: "mal:d=2,o=4,b=140:c,p,c"
+            - delay: 1800ms
+            - drv2605.pulse: 3
+            - delay: 300ms
+            - drv2605.pulse: 3
+            - delay: 300ms
+            - drv2605.pulse: 3
+      - delay: 1500ms
+      - output.turn_off: amp_enable
+
+  # Deja el cubo como lo deja el producto antes de dormir, y duerme 30 s. Con un amperímetro en
+  # serie con la batería se mide el consumo de reposo (esperado: unos 80 µA).
+  - id: dormir
+    mode: single
+    then:
+      - logger.log:
+          tag: prueba
+          level: INFO
+          format: "A dormir 30 s: medir el consumo ahora. Despierta solo, o antes si se lo mueve."
+      - output.turn_off: amp_enable
+      - drv2605.standby: haptic
+      - bq25896.prepare_sleep: charger
+      - cubo_system.prepare_sleep: sys
+      - lsm6dsv_cubo.arm_wake: imu
+      - delay: 50ms
+      - deep_sleep.enter:
+          id: ds
+          sleep_duration: 30s
+
+# ----------------------------------------------------------------------------
+#  Lo que muestra la página
+# ----------------------------------------------------------------------------
+binary_sensor:
+  - platform: bq25896
+    power_good:
+      id: docked
+      name: "En el dock"
+    charging:
+      id: charging
+      name: "Cargando"
+  - platform: cubo_system
+    usb_host:
+      id: usb_host
+      name: "USB conectado"
+      on_press:
+        - bq25896.set_input_current_limit: 500
+      on_release:
+        - bq25896.set_input_current_limit: 3250
+  - platform: gpio
+    id: charger_int
+    pin:
+      number: GPIO6
+      mode:
+        input: true
+      inverted: true
+      allow_other_uses: true
+    internal: true
+    on_press:
+      - component.update: charger
+  - platform: gpio
+    id: battery_alert
+    name: "Alerta batería"
+    pin:
+      number: GPIO17
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+      allow_other_uses: true
+  - platform: lsm6dsv_cubo
+    motion:
+      id: motion
+      name: "Movimiento"
+
+sensor:
+  - platform: max17048
+    id: gauge
+    address: 0x36
+    update_interval: 10s
+    alert_threshold: 5
+    battery_voltage:
+      id: battery_voltage
+      name: "Batería tensión"
+    battery_level:
+      id: battery_level
+      name: "Batería"
+  - platform: bq25896
+    battery_voltage:
+      id: charger_battery_voltage
+      name: "Batería tensión (cargador)"
+    charge_current:
+      id: charge_current
+      name: "Corriente de carga"
+    vbus_voltage:
+      id: vbus_voltage
+      name: "VBUS"
+  - platform: lsm6dsv_cubo
+    knob_angle:
+      id: knob_angle
+      name: "Perilla"
+    temperature:
+      id: imu_temperature
+      name: "Temperatura IMU"
+  - platform: sound_level
+    id: nivel
+    microphone:
+      microphone: mic
+      channels: 0
+      gain_factor: 4
+    passive: false
+    measurement_duration: 250ms
+    rms:
+      id: mic_rms
+      name: "Micrófono"
+
+text_sensor:
+  - platform: template
+    id: resultado
+    name: "Resultado"
+    icon: mdi:clipboard-check-outline
+  - platform: lsm6dsv_cubo
+    face:
+      id: face
+      name: "Cara arriba"
+  - platform: bq25896
+    charge_status:
+      id: charge_status
+      name: "Estado de carga"
+    fault:
+      id: charger_fault
+      name: "Fallo cargador"
+  - platform: cubo_system
+    wake_cause:
+      id: wake_cause
+      name: "Causa del despertar"
+
+button:
+  - platform: template
+    id: btn_repetir
+    name: "Repetir prueba"
+    icon: mdi:replay
+    on_press:
+      - script.execute: autoprueba
+  - platform: template
+    id: btn_haptic_test
+    name: "Probar háptico"
+    icon: mdi:vibrate
+    on_press:
+      - drv2605.pulse: 3
+  - platform: template
+    id: btn_parlante
+    name: "Probar parlante"
+    icon: mdi:volume-high
+    on_press:
+      - output.turn_on: amp_enable
+      - delay: 300ms
+      - rtttl.play: "escala:d=8,o=5,b=160:c,d,e,f,g,a,b,c6"
+      - delay: 3500ms
+      - output.turn_off: amp_enable
+  - platform: template
+    id: btn_dormir
+    name: "Dormir 30 s"
+    icon: mdi:power-sleep
+    on_press:
+      - script.execute: dormir
+  - platform: template
+    id: btn_ship_mode
+    name: "Ship mode"
+    icon: mdi:package-variant-closed
+    on_press:
+      - bq25896.ship_mode: charger
+  - platform: restart
+    id: btn_restart
+    name: "Reiniciar"

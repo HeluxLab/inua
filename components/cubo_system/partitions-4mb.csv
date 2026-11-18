@@ -1,0 +1,10 @@
+# Tabla de particiones de Inua para 4 MB de flash (ESP32-S3-MINI-1U-N4R2).
+# La tabla por defecto de ESPHome deja 448 kB para datos (nvs) y 2 x 1792 kB de programa.
+# Esta le deja 64 kB a los datos y 2 x 1984 kB al programa: 192 kB mas por copia.
+# Cambiar la tabla exige grabar por USB; por red (OTA) no se puede. Por eso se fija antes del primer prototipo.
+# Name,   Type, SubType, Offset,   Size
+otadata,  data, ota,     0x9000,   0x2000,
+phy_init, data, phy,     0xb000,   0x1000,
+app0,     app,  ota_0,   0x10000,  0x1F0000,
+app1,     app,  ota_1,   0x200000, 0x1F0000,
+nvs,      data, nvs,     0x3F0000, 0x10000,

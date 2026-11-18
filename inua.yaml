@@ -1,0 +1,854 @@
+# =============================================================================
+#  INUA — control de domótica por gestos (ESPHome / ESP-IDF, ESP32-S3-MINI-1U-N4R2)
+#
+#  Este archivo es la configuración pública del producto: no lleva credenciales.
+#    cubo.yaml          = este archivo + las credenciales de desarrollo (secrets.yaml)
+#    inua.factory.yaml  = este archivo + lo que lleva la unidad que sale de fábrica
+#
+#  Hardware (PCB1 rev 2026-10-30):
+#    IO4  TRIG   DRV2605L IN/TRIG (no se usa; se baja y retiene al dormir)
+#    IO5  WAKE   LSM6DSV16X INT1 -> despertador ext0 (nivel alto, latcheado)
+#    IO6  INT    BQ25896 INT (open-drain, R7 10k a 3V3) -> despertador ext1 (dock)
+#    IO7  CE     BQ25896 CE (R8 10k a GND: carga habilitada; no se toca)
+#    IO8  SDA    IO9 SCL   bus I2C: MAX17048 0x36, DRV2605L 0x5A, LSM6DSV16X 0x6A, BQ25896 0x6B
+#    IO10 BCLK   IO11 LRCLK   IO12 DIN   -> MAX98357A (I2S1)
+#    IO13 SDMODE MAX98357A: alto = canal izquierdo activo, bajo = apagado
+#    IO14 CLK    IO15 DATA  -> micrófono PDM IM66D120A (I2S0; U7, SELECT a GND = canal izquierdo)
+#    IO16        libre (era el reset del BNO055)
+#    IO17 ALERT  MAX17048 ALRT (open-drain, pull-up interno) -> despertador ext1 por batería baja
+#    IO19/IO20   USB nativo (programación y logs)
+#
+#  Funcionamiento:
+#    - Arranca al recibir alimentación. Si está en el dock (5 V presente) o enchufado
+#      a una PC, no duerme nunca: respuesta instantánea.
+#    - A batería: tras `idle_timeout` sin movimiento arma el wake-up del LSM6DSV16X,
+#      retiene los pines del audio en bajo y entra en deep sleep (~80 µA en total).
+#      Se despierta al tocarlo (INT1 del LSM6DSV16X), al apoyarlo en el dock (INT del
+#      cargador), cada 6 h por timer (solo para re-armar el sensor) o por batería baja
+#      (ALRT del medidor al cruzar el 5 %): en ese caso pasa a ship mode y protege la celda.
+#    - Gestos: la cara que queda arriba elige la función; girar como perilla manda
+#      rotate_cw / rotate_ccw cada `step_degrees`; un empujón corto manda slide_*
+#      en los ejes del propio cubo; un golpe suave en la cara de arriba manda tap.
+#      Todo sale como entidad "event" hacia HA.
+#    - Habitación: mientras está despierto escucha las balizas BLE de la casa (teclas HELUX,
+#      etiquetas iBeacon o cualquier aparato BLE fijo) y publica en qué habitación está, para
+#      que el mismo gesto actúe sobre las luces o la música de ese cuarto.
+#    - Asistente de voz: al poner arriba la cara elegida en "Assistant Face" empieza a
+#      escuchar, responde por el parlante y vuelve a reposo. El botón "Escuchar"
+#      hace lo mismo desde HA. En el dock (siempre despierto) además corre la
+#      wake word en el dispositivo (micro_wake_word); a batería no, porque escuchar
+#      en continuo consume ~100 mA.
+#    - Audio: media_player con decodificadores (FLAC/MP3/WAV) sobre los 2 MB de PSRAM
+#      del N4R2. Las respuestas del asistente llegan como archivo, sin límite de
+#      duración, y el cubo aparece en HA como reproductor (TTS, anuncios, música).
+# =============================================================================
+
+substitutions:
+  name: cubo
+  friendly_name: Cubo
+  # Nombres de fábrica de las 6 caras, en el orden fijo de ejes del LSM6DSV16X: +X, -X, +Y, -Y,
+  # +Z, -Z (Face 1 a Face 6). Son solo el valor inicial: cada nombre se cambia desde Home
+  # Assistant (entidades "Face 1" a "Face 6") y queda guardado en el cubo, sin recompilar.
+  face_x_plus: "Music"
+  face_x_minus: "Blinds"
+  face_y_plus: "Climate"
+  face_y_minus: "Lights"
+  face_z_plus: "Assistant"
+  face_z_minus: "Rest"
+  # Cara que arranca el asistente de voz al quedar arriba: None | Face 1 ... Face 6.
+  # También es solo el valor inicial: se cambia con la entidad "Assistant Face".
+  assistant_face: "Face 5"
+  idle_timeout: 20s
+  haptic_motor: reactor      # reactor = Alps AFT14A903A (pulsos unipolares) | erm | lra
+  haptic_frequency: 160Hz    # resonancias del AFT14A903A: 160 Hz (3 G) o 320 Hz (2,3 G, más seco)
+  wake_word_model: okay_nabu # okay_nabu | hey_jarvis | hey_mycroft (modelos incluidos en ESPHome)
+  # Ayudante de Home Assistant que mantiene despierto al cubo para actualizarlo. Fijo y no armado
+  # con ${name}: un cubo adoptado se llama inua-xxxxxx, y HA no acepta guiones en los ID.
+  update_mode_helper: input_boolean.inua_ota_mode
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    - priority: 599          # sensores ya leídos, Wi-Fi todavía no: batería baja -> ship mode
+      then:
+        - if:
+            condition:
+              lambda: 'return std::string(id(sys).wake_cause()) == "low battery";'
+            then:
+              - script.execute: low_battery_shutdown
+    - priority: 250          # ya están los periféricos, todavía no el Wi-Fi
+      then:
+        - if:
+            condition:
+              lambda: 'return std::string(id(sys).wake_cause()) == "motion";'
+            then:
+              - drv2605.pulse: {pulses: 1, amplitude: 60}   # toque suave: "te escuché, estoy despierto"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 4MB            # ESP32-S3-MINI-1U-N4R2: 4 MB flash, 2 MB PSRAM quad
+  # Sin `partitions:` a propósito: la tabla de Inua (2 x 1984 kB de programa; la de ESPHome da
+  # 2 x 1792 kB) la pone el componente cubo_system, así viaja con los componentes cuando alguien
+  # adopta el cubo desde GitHub.
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+psram:
+  id: psram_cfg
+  mode: quad                 # el R2 del MINI-1U es PSRAM quad, no octal
+  speed: 80MHz
+
+# Los componentes se bajan de este mismo repositorio, así la configuración compila también
+# cuando se la adopta o se la incluye desde otro equipo.
+external_components:
+  - source: github://HeluxLab/inua@main
+
+logger:
+  id: cube_logger
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  id: api_server
+  actions:
+    - action: haptic
+      variables:
+        effect: int
+      then:
+        - drv2605.play: !lambda "return (uint8_t) effect;"
+    - action: listen
+      then:
+        - voice_assistant.start:
+    - action: sleep_now
+      then:
+        - script.execute: go_to_sleep
+    # Aprende la baliza que está al lado del cubo y la asigna a esa habitación.
+    - action: learn_beacon
+      variables:
+        room: string
+      then:
+        - cubo_room.learn:
+            room: !lambda 'return room;'
+    # Olvida las balizas aprendidas de esa habitación.
+    - action: forget_beacons
+      variables:
+        room: string
+      then:
+        - cubo_room.forget:
+            room: !lambda 'return room;'
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+
+wifi:
+  id: wifi_net
+  # Sin red guardada levanta su propio punto de acceso para configurarlo desde el teléfono.
+  ap: {}
+  fast_connect: true         # una sola red: conecta en ~1 s al despertar
+  # Era `none` (latencia mínima). Con Bluetooth escaneando, Wi-Fi y Bluetooth se turnan la misma
+  # radio; `light` es el modo por defecto de ESPHome en ESP32 y el que se usa junto con Bluetooth.
+  # Lo que el cubo manda (los gestos) sale igual de rápido; lo que recibe puede esperar hasta el
+  # próximo beacon del router. No está verificado que `none` falle en el S3: con la placa en la
+  # mano se puede probar.
+  power_save_mode: light
+  # Recomendado para despertar más rápido todavía (evita DHCP):
+  # manual_ip:
+  #   static_ip: 192.168.1.60
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+
+captive_portal:
+  id: portal
+
+# Sin improv_serial: el USB no queda a la vista del usuario, así que el sello no lo pide.
+# La red se carga por Bluetooth (inua.factory.yaml) o por el punto de acceso.
+
+i2c:
+  id: bus_i2c
+  sda: GPIO8
+  scl: GPIO9
+  frequency: 100kHz          # alcanza; todos los chips del bus admiten 400 kHz si hiciera falta
+  scan: true
+
+# ----------------------------------------------------------------------------
+#  Periféricos propios (components/)
+# ----------------------------------------------------------------------------
+cubo_system:
+  id: sys
+  hold_low_pins: [13, 14, 4]   # SD_MODE, CLK mics, TRIG: en 0 durante el sueño (números de GPIO)
+  low_battery_pin: 17          # ALRT del MAX17048: pull-up interno al dormir, causa "low battery"
+
+lsm6dsv_cubo:
+  id: imu
+  address: 0x6A              # SA0 a GND; 0x6B es el cargador
+  update_interval: 20ms
+  step_degrees: 15           # grados por "clic" de perilla
+  rotation_deadband: 6       # dps: por debajo no se integra (deriva del giróscopo)
+  slide_threshold: 3.0       # m/s² del empujón que cuenta como deslizamiento
+  idle_timeout: ${idle_timeout}
+  idle_timeout_timer_wake: 3s
+  wake_threshold: 80         # mg de pendiente (wake-up) que despierta al cubo; pasos de 7,8 mg
+  wake_duration: 2           # muestras consecutivas a 15 Hz por encima del umbral
+  tap_threshold: 500         # mg del golpe en la cara de arriba que cuenta como toque; pasos de 125 mg; 0 = sin toque
+  face_names:
+    - ${face_x_plus}
+    - ${face_x_minus}
+    - ${face_y_plus}
+    - ${face_y_minus}
+    - ${face_z_plus}
+    - ${face_z_minus}
+  on_rotate:
+    - drv2605.pulse: 1       # un pulso = tick por cada paso
+  on_slide:
+    - drv2605.pulse: 2       # dos pulsos: deslizamiento
+  on_tap:
+    - drv2605.pulse: 1       # un pulso: toque
+  on_face:
+    - drv2605.pulse: 3       # clic completo (3 pulsos, el nominal de Alps): cambio de cara
+    - if:
+        condition:
+          # Por número de cara y no por nombre: renombrar una cara no cambia cuál es la del asistente.
+          lambda: |-
+            auto sel = id(assistant_face_sel).active_index();
+            return sel.has_value() && (int) *sel == face + 1;
+        then:
+          - delay: 400ms
+          - voice_assistant.start:
+        else:
+          - if:
+              condition:
+                voice_assistant.is_running:
+              then:
+                - voice_assistant.stop:
+  on_idle:
+    - script.execute: go_to_sleep
+
+bq25896:
+  id: charger
+  address: 0x6B
+  update_interval: 10s
+  charge_current: 1024       # mA; ajustar a la celda (0,5–1 C). El pin ILIM limita la entrada a 1,36 A.
+  charge_voltage: 4208       # mV
+  input_current_limit: 3250  # registro al máximo: manda el pin ILIM
+  battery_empty_voltage: 3300
+  battery_full_voltage: 4150
+
+drv2605:
+  id: haptic
+  address: 0x5A
+  motor_type: ${haptic_motor}
+  lra_frequency: ${haptic_frequency}
+  # AFT14A903A: 3,0 V nominal, 3,3 V máximo absoluto, 8 Ω. El riel de 3,3 V ya lo acota.
+  rated_voltage: 3.0V
+  max_voltage: 3.0V
+  # Con `reactor`, los gestos usan `drv2605.pulse: N` (N pulsos de 3,125 ms a 160 Hz, la forma
+  # de onda de la hoja de Alps). `drv2605.play: efecto` (ROM 1–123) sigue disponible para probar.
+  on_drive:
+    # Cada vez que vibra el motor, el sensor ignora los toques un rato: el golpe del propio
+    # háptico es, para el acelerómetro, igual a un toque. Subirlo si un clic dispara `tap`.
+    - lsm6dsv_cubo.inhibit_tap: 150ms
+  # Bloqueo entre motor y parlante: mientras el reproductor suena (música, anuncios o la respuesta
+  # del asistente) el motor no se mueve. El pico del motor cae sobre el mismo riel de 3,3 V que el
+  # Wi-Fi, que en ese momento está recibiendo audio. Los clics que caen ahí se pierden, no se
+  # encolan. El clic de "hablá" del asistente sale igual: en ese momento todavía no suena nada.
+  inhibit: !lambda |-
+    return id(mp).state == media_player::MEDIA_PLAYER_STATE_PLAYING ||
+           id(mp).state == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
+
+# ----------------------------------------------------------------------------
+#  Habitación: balizas BLE
+# ----------------------------------------------------------------------------
+# El cubo escucha las balizas fijas de la casa y se queda con la más fuerte: esa es la
+# habitación. HA la recibe en el sensor "Room" y las automatizaciones actúan sobre esa área.
+esp32_ble:
+  id: ble
+  use_psram: true            # tablas de Bluedroid en el heap y no en RAM fija
+
+esp32_ble_tracker:
+  id: ble_tracker
+  scan_parameters:
+    interval: 160ms          # escucha 40 ms de cada 160: el 25 % del tiempo de radio; el resto es del Wi-Fi
+    window: 40ms
+    active: false            # solo escucha; no interroga a las balizas
+    continuous: true
+
+cubo_room:
+  id: room
+  hysteresis: 6              # dB por los que otra habitación tiene que ganar para quedarse con el cubo
+  min_rssi: -85              # dBm: una baliza más floja que esto no alcanza para elegir habitación
+  timeout: 30s               # tiempo de escaneo sin oírla para dar una baliza por perdida
+  settle_time: 3s            # al arrancar junta lecturas este tiempo antes de decidir
+  discovery: false           # true: lista en el log los aparatos BLE cercanos cada 10 s (para diagnóstico)
+  # Las balizas se aprenden con el cubo andando, sin recompilar: se apoya el cubo al lado de la
+  # baliza, se escribe la habitación en "Room to Learn" y se toca "Learn Beacon".
+  # Quedan guardadas en el cubo (hasta 12). El nombre tiene que ser el del área en Home Assistant.
+  learn_min_rssi: -65        # dBm mínimos para aceptar un aparato al aprender: tiene que estar al lado
+  on_learned:
+    - drv2605.pulse: 2       # dos pulsos: baliza aprendida
+  on_learn_failed:
+    - drv2605.pulse: 3       # dos clics completos: no se aprendió
+    - delay: 250ms
+    - drv2605.pulse: 3
+  # También se pueden dejar fijas acá (estas no se borran con "Olvidar"):
+  beacons: []
+  # Una entrada por baliza. `room` tiene que ser el nombre del área en Home Assistant. Ejemplos:
+  #   - room: "Living"                   # tecla HELUX o cualquier etiqueta iBeacon
+  #     ibeacon_uuid: "93ca375c-f277-4553-8dae-7eae34fe9ab1"   # el de las teclas HELUX
+  #     ibeacon_minor: 1
+  #   - room: "Dormitorio"               # cualquier aparato BLE con dirección fija
+  #     mac_address: "A4:C1:38:00:00:00"
+  #     offset: 4                        # dB de corrección si esa baliza llega floja
+  # on_room:                             # se dispara al cambiar de habitación; `room` es el nombre
+  #   - drv2605.pulse: 2
+
+# ----------------------------------------------------------------------------
+#  Audio
+# ----------------------------------------------------------------------------
+i2s_audio:
+  - id: i2s_mic              # PRIMERO: queda en I2S0, el único puerto del S3 con PDM RX
+    i2s_lrclk_pin: GPIO14    # en modo PDM el reloj sale por el pin WS
+  - id: i2s_amp
+    i2s_lrclk_pin: GPIO11
+    i2s_bclk_pin: GPIO10
+
+microphone:
+  - platform: i2s_audio
+    id: mic
+    i2s_audio_id: i2s_mic
+    adc_type: external
+    i2s_din_pin: GPIO15
+    pdm: true
+    channel: left            # U7 (SELECT a GND). Si no hay audio, probar "right".
+    sample_rate: 16000
+    bits_per_sample: 16bit
+
+speaker:
+  # Salida física: MAX98357A por I2S1. SD_MODE a 3,3 V = reproduce el canal izquierdo;
+  # "mono" manda la misma muestra a los dos canales.
+  - platform: i2s_audio
+    id: spk
+    i2s_audio_id: i2s_amp
+    dac_type: external
+    i2s_dout_pin: GPIO12
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    channel: mono
+    buffer_duration: 100ms
+  # Mezclador: anuncios/TTS por un canal, música por el otro, con ducking automático.
+  - platform: mixer
+    id: mixer_spk
+    output_speaker: spk
+    num_channels: 1
+    source_speakers:
+      - id: announcement_mix_in
+        timeout: never
+      - id: media_mix_in
+        timeout: never
+  # Remuestreadores: cada pipeline entrega lo que sea (22 kHz del TTS, 44,1 kHz de
+  # música) y acá se lleva a los 48 kHz del I2S.
+  - platform: resampler
+    id: announcement_resampler
+    output_speaker: announcement_mix_in
+  - platform: resampler
+    id: media_resampler
+    output_speaker: media_mix_in
+
+media_player:
+  - platform: speaker
+    id: mp
+    name: "Media Player"
+    volume_increment: 0.05
+    volume_min: 0.0
+    volume_max: 1.0
+    announcement_pipeline:
+      speaker: announcement_resampler
+      format: FLAC
+      sample_rate: 48000
+      num_channels: 1
+    media_pipeline:
+      speaker: media_resampler
+      format: FLAC
+      sample_rate: 48000
+      num_channels: 1
+    # Con 2 MB de PSRAM: buffers más chicos que el 1 MB por defecto de cada pipeline.
+    buffer_size: 400000
+    task_stack_in_psram: true
+    on_announcement:
+      - output.turn_on: amp_enable
+    on_play:
+      - output.turn_on: amp_enable
+    on_idle:
+      - output.turn_off: amp_enable
+
+output:
+  - platform: gpio
+    id: amp_enable
+    pin: GPIO13
+
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: mic
+    channels: 0
+    gain_factor: 4
+  vad:
+  models:
+    - model: ${wake_word_model}
+  on_wake_word_detected:
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone: mic
+  media_player: mp           # las respuestas llegan como archivo y las decodifica el reproductor
+  micro_wake_word: mww
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  on_listening:
+    - drv2605.pulse: 3       # clic fuerte: "hablá"
+  on_end:
+    # En el dock, volver a escuchar la wake word cuando termina la conversación.
+    - if:
+        condition:
+          binary_sensor.is_on: docked
+        then:
+          - micro_wake_word.start:
+  on_error:
+    - drv2605.pulse: 3       # el reactor no admite zumbidos largos (50 ms mín. entre disparos)
+    - if:
+        condition:
+          binary_sensor.is_on: docked
+        then:
+          - micro_wake_word.start:
+
+# ----------------------------------------------------------------------------
+#  Deep sleep
+# ----------------------------------------------------------------------------
+deep_sleep:
+  id: ds
+  wakeup_pin:
+    number: GPIO5            # LSM6DSV16X INT1, activo alto, latcheado
+  wakeup_pin_mode: IGNORE    # si INT quedó alto, despierta al instante y lo limpia en el arranque
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO6        # BQ25896 INT: pulso bajo al apoyarlo en el dock
+        allow_other_uses: true
+      - number: GPIO17       # MAX17048 ALRT: baja al cruzar alert_threshold -> ship mode
+        allow_other_uses: true
+    mode: ANY_LOW              # en ESP32-S3 el modo ext1 de nivel bajo es ANY_LOW
+  sleep_duration: 6h         # despertar de mantenimiento: re-arma el LSM6DSV16X y vuelve a dormir
+
+script:
+  - id: go_to_sleep
+    mode: single
+    then:
+      - if:
+          condition:
+            or:
+              - binary_sensor.is_on: docked
+              - binary_sensor.is_on: usb_host
+              - binary_sensor.is_on: ota_mode
+              - switch.is_on: stay_awake
+              # Sin Wi-Fi cargado todavía: se queda despierto 10 minutos desde que se lo tocó, para
+              # poder configurarlo sin la base. Con la red ya cargada esta condición no aplica nunca.
+              - lambda: 'return !wifi::global_wifi_component->has_sta() && millis() < 600000;'
+              - lambda: 'return id(room).is_learning();'   # aprendiendo una baliza: son 10 s de escucha
+              - voice_assistant.is_running:
+              - media_player.is_playing: mp
+              - media_player.is_announcing: mp
+          then:
+            - logger.log: "No duermo: dock / USB / modo OTA / sin Wi-Fi cargado / asistente o audio activo"
+          else:
+            - logger.log: "A dormir"
+            - micro_wake_word.stop:
+            - voice_assistant.stop:
+            - media_player.stop: mp
+            - output.turn_off: amp_enable
+            - drv2605.standby: haptic
+            - bq25896.prepare_sleep: charger
+            - cubo_system.prepare_sleep: sys
+            - lsm6dsv_cubo.arm_wake: imu
+            - delay: 50ms
+            - deep_sleep.enter: ds
+  # Batería al 5 % sin alimentación externa: corta la batería (BATFET_DIS) para que la celda
+  # no siga bajando. Vuelve solo al apoyarlo en el dock. Lo dispara el ALRT del medidor (dormido
+  # o despierto) y el propio sensor de batería (despierto).
+  - id: low_battery_shutdown
+    mode: single
+    then:
+      - component.update: charger
+      - if:
+          condition:
+            or:
+              - binary_sensor.is_on: docked
+              - binary_sensor.is_on: usb_host
+          then:
+            - logger.log: "Batería baja, pero con alimentación: sigo"
+          else:
+            - logger.log:
+                format: "Batería %.0f %%: ship mode para proteger la celda"
+                args: ['id(battery_level).state']
+            - drv2605.pulse: 3
+            - delay: 300ms
+            - bq25896.ship_mode: charger
+
+interval:
+  # Si el primer intento de dormir se bloqueó (dock, USB, OTA...) y después se
+  # liberó, este chequeo vuelve a intentarlo mientras el cubo siga quieto.
+  - interval: 15s
+    id: sleep_retry
+    then:
+      - if:
+          condition:
+            lambda: 'return id(imu).is_idle();'
+          then:
+            - script.execute: go_to_sleep
+
+# ----------------------------------------------------------------------------
+#  Entidades
+# ----------------------------------------------------------------------------
+binary_sensor:
+  - platform: bq25896
+    power_good:
+      id: docked
+      name: "Docked"
+      on_press:
+        - micro_wake_word.start:     # en el dock: wake word siempre activa
+      on_release:
+        - micro_wake_word.stop:      # a batería: solo gesto o botón
+    charging:
+      id: charging
+      name: "Charging"
+  - platform: cubo_system
+    usb_host:
+      id: usb_host
+      name: "USB Connected"
+      on_press:
+        - bq25896.set_input_current_limit: 500      # puerto de PC: 500 mA
+      on_release:
+        - bq25896.set_input_current_limit: 3250     # vuelve a mandar el pin ILIM
+  - platform: gpio
+    id: charger_int
+    pin:
+      number: GPIO6
+      mode:
+        input: true
+      inverted: true
+      allow_other_uses: true
+    internal: true
+    on_press:
+      - component.update: charger
+  - platform: gpio
+    id: battery_alert
+    name: "Battery Alert"
+    device_class: battery
+    pin:
+      number: GPIO17
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+      allow_other_uses: true
+    on_press:
+      - script.execute: low_battery_shutdown
+  - platform: homeassistant
+    id: ota_mode
+    entity_id: ${update_mode_helper}   # crearlo en HA (Ajustes > Ayudantes > Interruptor)
+    name: "Update Mode (HA)"
+  - platform: lsm6dsv_cubo
+    motion:
+      id: motion
+      name: "Motion"
+
+sensor:
+  - platform: max17048         # medidor ModelGauge (U5), colgado de BAT: % real, no estimado por tensión
+    id: gauge
+    address: 0x36
+    update_interval: 60s
+    alert_threshold: 5         # el pin ALRT (IO17) baja al cruzar 5 %: despierta al cubo y pasa a ship mode
+    battery_voltage:
+      id: battery_voltage
+      name: "Battery Voltage"
+    charge_rate:
+      id: battery_rate
+      name: "Battery Charge Rate"
+    time_to_empty:
+      id: battery_time_to_empty
+      name: "Battery Time to Empty"
+    time_to_full:
+      id: battery_time_to_full
+      name: "Battery Time to Full"
+    battery_level:
+      id: battery_level
+      name: "Battery"
+      on_value:
+        - if:
+            condition:
+              lambda: 'return x <= 5;'
+            then:
+              - script.execute: low_battery_shutdown
+        # Decisión de diseño: con batería baja se baja el volumen para que los picos
+        # del amplificador (que cuelga de SYS) no hundan la celda casi vacía.
+        - if:
+            condition:
+              lambda: 'return x < 25;'
+            then:
+              - media_player.volume_set:
+                  id: mp
+                  volume: 0.4
+            else:
+              - media_player.volume_set:
+                  id: mp
+                  volume: !lambda 'return id(volume).state / 100.0f;'
+  - platform: bq25896
+    battery_voltage:
+      id: charger_battery_voltage
+      name: "Battery Voltage (Charger)"
+      internal: true           # ADC de 20 mV de paso; queda para el log, el MAX17048 manda
+    charge_current:
+      id: charge_current
+      name: "Charge Current"
+    vbus_voltage:
+      id: vbus_voltage
+      name: "Input Voltage"
+  - platform: lsm6dsv_cubo
+    knob_angle:
+      id: knob_angle
+      name: "Knob Angle"
+    temperature:
+      id: imu_temperature
+      name: "IMU Temperature"
+  - platform: cubo_room
+    rssi:
+      id: beacon_rssi
+      name: "Beacon Signal"
+
+text_sensor:
+  - platform: lsm6dsv_cubo
+    face:
+      id: face
+      name: "Face Up"
+  - platform: bq25896
+    charge_status:
+      id: charge_status
+      name: "Charge Status"
+    fault:
+      id: charger_fault
+      name: "Charger Fault"
+  - platform: cubo_system
+    wake_cause:
+      id: wake_cause
+      name: "Wake Cause"
+  - platform: cubo_room
+    room:
+      id: room_name
+      name: "Room"
+    beacons:                   # cuántas balizas hay por habitación y el resultado del último aprendizaje
+      id: beacon_list
+      name: "Beacons"
+      entity_category: diagnostic
+
+# ----------------------------------------------------------------------------
+#  Ajustes que se cambian desde Home Assistant y quedan guardados en el cubo
+# ----------------------------------------------------------------------------
+text:
+  # Nombres de las caras. Face 1 a Face 6 = ejes +X, -X, +Y, -Y, +Z, -Z del sensor.
+  # Para saber cuál es cuál: poner la cara arriba y mirar "Face Up".
+  - platform: template
+    id: face_name_1
+    name: "Face 1"
+    icon: mdi:cube-outline
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 1
+    max_length: 20
+    initial_value: ${face_x_plus}
+    on_value:
+      - lambda: 'id(imu).set_face_name(0, x);'
+  - platform: template
+    id: face_name_2
+    name: "Face 2"
+    icon: mdi:cube-outline
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 1
+    max_length: 20
+    initial_value: ${face_x_minus}
+    on_value:
+      - lambda: 'id(imu).set_face_name(1, x);'
+  - platform: template
+    id: face_name_3
+    name: "Face 3"
+    icon: mdi:cube-outline
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 1
+    max_length: 20
+    initial_value: ${face_y_plus}
+    on_value:
+      - lambda: 'id(imu).set_face_name(2, x);'
+  - platform: template
+    id: face_name_4
+    name: "Face 4"
+    icon: mdi:cube-outline
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 1
+    max_length: 20
+    initial_value: ${face_y_minus}
+    on_value:
+      - lambda: 'id(imu).set_face_name(3, x);'
+  - platform: template
+    id: face_name_5
+    name: "Face 5"
+    icon: mdi:cube-outline
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 1
+    max_length: 20
+    initial_value: ${face_z_plus}
+    on_value:
+      - lambda: 'id(imu).set_face_name(4, x);'
+  - platform: template
+    id: face_name_6
+    name: "Face 6"
+    icon: mdi:cube-outline
+    entity_category: config
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 1
+    max_length: 20
+    initial_value: ${face_z_minus}
+    on_value:
+      - lambda: 'id(imu).set_face_name(5, x);'
+  # Habitación para los botones "Learn Beacon" y "Forget Room Beacons".
+  - platform: template
+    id: learn_room
+    name: "Room to Learn"
+    icon: mdi:map-marker-plus
+    entity_category: config
+    mode: text
+    optimistic: true
+    max_length: 24
+
+select:
+  - platform: template
+    id: assistant_face_sel
+    name: "Assistant Face"
+    icon: mdi:microphone-message
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - "None"
+      - "Face 1"
+      - "Face 2"
+      - "Face 3"
+      - "Face 4"
+      - "Face 5"
+      - "Face 6"
+    initial_option: ${assistant_face}
+
+event:
+  - platform: lsm6dsv_cubo
+    id: gesture
+    name: "Gesture"
+
+switch:
+  - platform: template
+    id: stay_awake
+    name: "Stay Awake"
+    icon: mdi:sleep-off
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+number:
+  - platform: template
+    id: volume
+    name: "Volume"
+    icon: mdi:volume-high
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 70
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    on_value:
+      - media_player.volume_set:
+          id: mp
+          volume: !lambda 'return x / 100.0f;'
+
+button:
+  - platform: template
+    id: btn_listen
+    name: "Listen"
+    icon: mdi:microphone
+    on_press:
+      - voice_assistant.start:
+  - platform: template
+    id: btn_sleep
+    name: "Sleep Now"
+    icon: mdi:power-sleep
+    on_press:
+      - script.execute: go_to_sleep
+  - platform: template
+    id: btn_haptic_test
+    name: "Test Haptics"
+    icon: mdi:vibrate
+    on_press:
+      - drv2605.pulse: 3
+  - platform: template
+    id: btn_ship_mode
+    name: "Ship Mode"
+    icon: mdi:package-variant-closed
+    entity_category: config
+    on_press:
+      - bq25896.ship_mode: charger
+  - platform: restart
+    id: btn_restart
+    name: "Restart"
+    entity_category: config
+  # Balizas: el cubo tiene que estar despierto y al lado de la baliza. Escucha 10 s y avisa con
+  # dos pulsos si la aprendió; el resultado queda en la entidad "Beacons".
+  - platform: template
+    id: btn_learn_beacon
+    name: "Learn Beacon"
+    icon: mdi:access-point-plus
+    entity_category: config
+    on_press:
+      - cubo_room.learn:
+          room: !lambda 'return id(learn_room).state;'
+  - platform: template
+    id: btn_forget_room
+    name: "Forget Room Beacons"
+    icon: mdi:access-point-minus
+    entity_category: config
+    on_press:
+      - cubo_room.forget:
+          room: !lambda 'return id(learn_room).state;'
+  - platform: template
+    id: btn_forget_all
+    name: "Forget All Beacons"
+    icon: mdi:access-point-remove
+    entity_category: config
+    on_press:
+      - cubo_room.clear: room
