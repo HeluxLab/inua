@@ -172,5 +172,20 @@ updated over the air. One helper serves all your cubes; to use another one, set 
 
 ## License
 
+Copyright (C) 2026 HELUX LABS.
+
 The firmware in this repository is licensed under the GNU General Public License v3.0. See
 [LICENSE](LICENSE).
+
+### Trademarks
+
+The following additional terms apply to this repository, as allowed by section 7 of the GPLv3:
+
+- **Section 7(e).** This license grants no right to use the names "Inua" and "HELUX LABS", or
+  their logos, as trade names, trademarks or service marks.
+- **Section 7(c).** A modified version must be marked as different from the original. It must not
+  be presented as Inua or as a HELUX LABS product, and must not use those names or logos on a
+  device, firmware or package.
+
+You can still use, study, modify and share the firmware under the GPLv3. Saying that your work is
+based on or compatible with Inua is fine.
